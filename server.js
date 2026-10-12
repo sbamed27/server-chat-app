@@ -168,12 +168,36 @@ io.on('connection', async (socket) => {
     console.log(`[Replica Host: ${os.hostname()}] Authenticated user connected: ${socket.username} (ID: ${socket.userId})`);
 
     try {
-        // Send back list of all registered users (except self) upon connection
-        const { rows: users } = await pool.query('SELECT username FROM users WHERE id != $1', [socket.userId]);
-        socket.emit('user_list', users.map(u => u.username));
+        // 1. Add user ID to Redis online set
+        await pubClient.sAdd('online_users', socket.userId.toString());
+
+        // Broadcast to all other connected clients that this user is now online
+        socket.broadcast.emit('user_status', { username: socket.username, isOnline: true });
+
+        // 2. Fetch all registered users (except self) and check status in Redis
+        const { rows: users } = await pool.query('SELECT id, username FROM users WHERE id != $1', [socket.userId]);
+        const onlineUserIds = await pubClient.sMembers('online_users');
+
+        const usersWithStatus = users.map(u => ({
+            username: u.username,
+            isOnline: onlineUserIds.includes(u.id.toString())
+        }));
+
+        socket.emit('user_list', usersWithStatus);
     } catch (err) {
-        console.error('Error fetching user list:', err);
+        console.error('Error fetching user list or presence:', err);
     }
+
+    // Handle user disconnect presence clean-up
+    socket.on('disconnect', async () => {
+        try {
+            await pubClient.sRem('online_users', socket.userId.toString());
+            socket.broadcast.emit('user_status', { username: socket.username, isOnline: false });
+            console.log(`[Replica Host: ${os.hostname()}] User disconnected: ${socket.username}`);
+        } catch (err) {
+            console.error('Error handling disconnect presence:', err);
+        }
+    });
 
     // Join a private chat room using immutable IDs
     socket.on('join_private_chat', async ({ recipient }, callback) => {
