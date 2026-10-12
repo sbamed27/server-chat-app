@@ -172,13 +172,14 @@ io.on('connection', async (socket) => {
         await pubClient.sAdd('online_users', socket.userId.toString());
 
         // Broadcast to all other connected clients that this user is now online
-        socket.broadcast.emit('user_status', { username: socket.username, isOnline: true });
+        socket.broadcast.emit('user_status', { id: socket.userId, username: socket.username, isOnline: true });
 
         // 2. Fetch all registered users (except self) and check status in Redis
         const { rows: users } = await pool.query('SELECT id, username FROM users WHERE id != $1', [socket.userId]);
         const onlineUserIds = await pubClient.sMembers('online_users');
 
         const usersWithStatus = users.map(u => ({
+            id: u.id,
             username: u.username,
             isOnline: onlineUserIds.includes(u.id.toString())
         }));
@@ -192,7 +193,7 @@ io.on('connection', async (socket) => {
     socket.on('disconnect', async () => {
         try {
             await pubClient.sRem('online_users', socket.userId.toString());
-            socket.broadcast.emit('user_status', { username: socket.username, isOnline: false });
+            socket.broadcast.emit('user_status', { id: socket.userId, username: socket.username, isOnline: false });
             console.log(`[Replica Host: ${os.hostname()}] User disconnected: ${socket.username}`);
         } catch (err) {
             console.error('Error handling disconnect presence:', err);
@@ -200,13 +201,17 @@ io.on('connection', async (socket) => {
     });
 
     // Join a private chat room using immutable IDs
-    socket.on('join_private_chat', async ({ recipient }, callback) => {
+    socket.on('join_private_chat', async ({ recipient, recipientId }, callback) => {
         try {
-            const recipientRes = await pool.query('SELECT id FROM users WHERE username = $1', [recipient]);
-            if (recipientRes.rows.length === 0) return callback({ success: false });
-            const recipientId = recipientRes.rows[0].id;
+            let targetId = recipientId;
+            if (!targetId && recipient) {
+                const recipientRes = await pool.query('SELECT id FROM users WHERE username = $1', [recipient]);
+                if (recipientRes.rows.length === 0) return callback({ success: false });
+                targetId = recipientRes.rows[0].id;
+            }
+            if (!targetId) return callback({ success: false });
 
-            const roomName = getRoomName(socket.userId, recipientId);
+            const roomName = getRoomName(socket.userId, targetId);
             socket.join(roomName);
 
             const { rows } = await pool.query(`
@@ -217,9 +222,9 @@ io.on('connection', async (socket) => {
                 OR (m.sender_id = $2 AND m.recipient_id = $1)
                 ORDER BY m.created_at ASC 
                 LIMIT 50
-            `, [socket.userId, recipientId]);
+            `, [socket.userId, targetId]);
 
-            callback({ success: true, history: rows });
+            callback({ success: true, history: rows, recipientId: targetId });
         } catch (err) {
             console.error('Error joining private chat:', err);
             callback({ success: false });
@@ -227,25 +232,70 @@ io.on('connection', async (socket) => {
     });
 
     // Handle incoming private messages using IDs
-    socket.on('private_message', async ({ recipient, content }) => {
+    socket.on('private_message', async ({ recipient, recipientId, content }) => {
         try {
-            const recipientRes = await pool.query('SELECT id FROM users WHERE username = $1', [recipient]);
-            if (recipientRes.rows.length === 0) return;
-            const recipientId = recipientRes.rows[0].id;
+            let targetId = recipientId;
+            if (!targetId && recipient) {
+                const recipientRes = await pool.query('SELECT id FROM users WHERE username = $1', [recipient]);
+                if (recipientRes.rows.length === 0) return;
+                targetId = recipientRes.rows[0].id;
+            }
+            if (!targetId) return;
 
             await pool.query(`
                 INSERT INTO messages (sender_id, recipient_id, content) 
                 VALUES ($1, $2, $3)
-            `, [socket.userId, recipientId, content]);
+            `, [socket.userId, targetId, content]);
 
-            const roomName = getRoomName(socket.userId, recipientId);
+            const roomName = getRoomName(socket.userId, targetId);
 
             socket.to(roomName).emit('private_message', {
                 sender: socket.username,
+                senderId: socket.userId,
                 content
             });
         } catch (err) {
             console.error('Error saving private message:', err);
+        }
+    });
+
+    // Handle typing indicator start
+    socket.on('typing_start', async ({ recipientId, recipient }) => {
+        try {
+            let targetId = recipientId;
+            if (!targetId && recipient) {
+                const recipientRes = await pool.query('SELECT id FROM users WHERE username = $1', [recipient]);
+                if (recipientRes.rows.length > 0) targetId = recipientRes.rows[0].id;
+            }
+            if (!targetId) return;
+
+            const roomName = getRoomName(socket.userId, targetId);
+            socket.to(roomName).emit('typing_start', {
+                sender: socket.username,
+                senderId: socket.userId
+            });
+        } catch (err) {
+            console.error('Error handling typing_start:', err);
+        }
+    });
+
+    // Handle typing indicator stop
+    socket.on('typing_stop', async ({ recipientId, recipient }) => {
+        try {
+            let targetId = recipientId;
+            if (!targetId && recipient) {
+                const recipientRes = await pool.query('SELECT id FROM users WHERE username = $1', [recipient]);
+                if (recipientRes.rows.length > 0) targetId = recipientRes.rows[0].id;
+            }
+            if (!targetId) return;
+
+            const roomName = getRoomName(socket.userId, targetId);
+            socket.to(roomName).emit('typing_stop', {
+                sender: socket.username,
+                senderId: socket.userId
+            });
+        } catch (err) {
+            console.error('Error handling typing_stop:', err);
         }
     });
 });
