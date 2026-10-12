@@ -3,6 +3,7 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import { createClient } from 'redis';
 import { createAdapter } from '@socket.io/redis-adapter';
+import cors from 'cors';
 import pkg from 'pg';
 const { Pool } = pkg;
 import bcrypt from 'bcryptjs';
@@ -21,6 +22,12 @@ const JWT_SECRET = process.env.JWT_SECRET || 'portfolio_super_secret_jwt_key_202
 const allowedOrigins = process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(',')
     : ['http://localhost:3000'];
+
+app.use(cors({
+    origin: allowedOrigins,
+    methods: ["GET", "POST"],
+    credentials: true
+}));
 
 const io = new Server(httpServer, {
     cors: {
