@@ -50,8 +50,15 @@ async function initDB() {
                 id SERIAL PRIMARY KEY,
                 username VARCHAR(50) UNIQUE NOT NULL,
                 password_hash VARCHAR(255) NOT NULL,
+                display_name VARCHAR(100),
+                bio TEXT,
+                status_message VARCHAR(255),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(100);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS status_message VARCHAR(255);
+
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
                 sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -70,7 +77,7 @@ async function initDB() {
             );
         `);
 
-        console.log('PostgreSQL: tables and columns verified/created with Auth & Friendship support');
+        console.log('PostgreSQL: tables and columns verified/created with Auth, Profile & Friendship support');
     } catch (err) {
         console.error('Database initialization error:', err);
     }
@@ -80,7 +87,7 @@ initDB();
 // Fetch accepted friends for a user with real-time presence from Redis (optimized with SMISMEMBER)
 async function getAcceptedFriends(userId) {
     const { rows: friends } = await pool.query(`
-        SELECT u.id, u.username
+        SELECT u.id, u.username, u.display_name, u.bio, u.status_message
         FROM users u
         JOIN friendships f ON (
             (f.sender_id = $1 AND f.receiver_id = u.id) OR 
@@ -109,6 +116,9 @@ async function getAcceptedFriends(userId) {
     return friends.map((u, index) => ({
         id: u.id,
         username: u.username,
+        displayName: u.display_name || u.username,
+        bio: u.bio || '',
+        statusMessage: u.status_message || '',
         isOnline: Boolean(presenceFlags && presenceFlags[index])
     }));
 }
@@ -215,7 +225,7 @@ app.get('/api/users/search', authenticateToken, async (req, res) => {
         const query = req.query.q || '';
         if (!query.trim()) return res.json({ users: [] });
         const { rows } = await pool.query(`
-            SELECT u.id, u.username FROM users u
+            SELECT u.id, u.username, u.display_name, u.status_message FROM users u
             WHERE u.id != $1
               AND u.username ILIKE $2
               AND NOT EXISTS (
@@ -228,6 +238,82 @@ app.get('/api/users/search', authenticateToken, async (req, res) => {
         res.json({ users: rows });
     } catch (err) {
         console.error('REST Search error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// --- REST API: GET USER PROFILE ---
+app.get('/api/profile/:identifier', async (req, res) => {
+    try {
+        const { identifier } = req.params;
+        const isNumeric = /^\d+$/.test(identifier);
+        const query = isNumeric
+            ? 'SELECT id, username, display_name, bio, status_message, created_at FROM users WHERE id = $1'
+            : 'SELECT id, username, display_name, bio, status_message, created_at FROM users WHERE username = $1';
+        const { rows } = await pool.query(query, [identifier]);
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        res.json({ success: true, profile: rows[0] });
+    } catch (err) {
+        console.error('Error fetching profile:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// --- REST API: UPDATE PROFILE (Protected by authenticateToken) ---
+app.put('/api/profile', authenticateToken, async (req, res) => {
+    try {
+        const updates = [];
+        const values = [];
+        let paramIdx = 1;
+        const { display_name, bio, status_message } = req.body;
+
+        if (display_name !== undefined) {
+            updates.push(`display_name = $${paramIdx++}`);
+            values.push(display_name ? display_name.trim().substring(0, 100) : null);
+        }
+        if (bio !== undefined) {
+            updates.push(`bio = $${paramIdx++}`);
+            values.push(bio ? bio.trim().substring(0, 500) : null);
+        }
+        if (status_message !== undefined) {
+            updates.push(`status_message = $${paramIdx++}`);
+            values.push(status_message ? status_message.trim().substring(0, 255) : null);
+        }
+
+        if (updates.length === 0) {
+            const { rows: currentRows } = await pool.query('SELECT id, username, display_name, bio, status_message, created_at FROM users WHERE id = $1', [req.user.id]);
+            if (currentRows.length === 0) return res.status(404).json({ error: 'User not found' });
+            return res.json({ success: true, profile: currentRows[0] });
+        }
+
+        values.push(req.user.id);
+        const { rows } = await pool.query(`
+            UPDATE users 
+            SET ${updates.join(', ')}
+            WHERE id = $${paramIdx}
+            RETURNING id, username, display_name, bio, status_message, created_at
+        `, values);
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        const updatedProfile = rows[0];
+
+        // Broadcast profile update across redis / connected sockets
+        io.emit('profile_updated', {
+            id: updatedProfile.id,
+            username: updatedProfile.username,
+            displayName: updatedProfile.display_name || updatedProfile.username,
+            bio: updatedProfile.bio || '',
+            statusMessage: updatedProfile.status_message || ''
+        });
+
+        res.json({ success: true, profile: updatedProfile });
+    } catch (err) {
+        console.error('Error updating profile:', err);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
@@ -311,7 +397,7 @@ io.on('connection', async (socket) => {
             }
             const q = query.trim();
             const { rows } = await pool.query(`
-                SELECT u.id, u.username FROM users u
+                SELECT u.id, u.username, u.display_name, u.status_message FROM users u
                 WHERE u.id != $1
                   AND u.username ILIKE $2
                   AND NOT EXISTS (
