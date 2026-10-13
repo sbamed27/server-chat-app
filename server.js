@@ -59,14 +59,71 @@ async function initDB() {
                 content TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS friendships (
+                id SERIAL PRIMARY KEY,
+                sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                receiver_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (sender_id, receiver_id)
+            );
         `);
 
-        console.log('PostgreSQL: tables and columns verified/created with Auth support');
+        console.log('PostgreSQL: tables and columns verified/created with Auth & Friendship support');
     } catch (err) {
         console.error('Database initialization error:', err);
     }
 }
 initDB();
+
+// Fetch accepted friends for a user with real-time presence from Redis (optimized with SMISMEMBER)
+async function getAcceptedFriends(userId) {
+    const { rows: friends } = await pool.query(`
+        SELECT u.id, u.username
+        FROM users u
+        JOIN friendships f ON (
+            (f.sender_id = $1 AND f.receiver_id = u.id) OR 
+            (f.receiver_id = $1 AND f.sender_id = u.id)
+        )
+        WHERE f.status = 'accepted'
+        ORDER BY u.username ASC
+    `, [userId]);
+
+    if (friends.length === 0) {
+        return [];
+    }
+
+    // High-scale optimization: check friend IDs directly via Redis SMISMEMBER (or pipeline fallback)
+    // Avoids pulling the entire global online set into Node.js memory
+    const friendIds = friends.map(f => f.id.toString());
+    let presenceFlags = [];
+    try {
+        presenceFlags = await pubClient.smIsMember('online_users', friendIds);
+    } catch (err) {
+        const pipeline = pubClient.multi();
+        friendIds.forEach(id => pipeline.sIsMember('online_users', id));
+        presenceFlags = await pipeline.exec();
+    }
+
+    return friends.map((u, index) => ({
+        id: u.id,
+        username: u.username,
+        isOnline: Boolean(presenceFlags && presenceFlags[index])
+    }));
+}
+
+// Fetch incoming pending requests for a user
+async function getPendingRequests(userId) {
+    const { rows } = await pool.query(`
+        SELECT f.id AS request_id, u.id AS sender_id, u.username AS sender_username, f.created_at
+        FROM friendships f
+        JOIN users u ON f.sender_id = u.id
+        WHERE f.receiver_id = $1 AND f.status = 'pending'
+        ORDER BY f.created_at DESC
+    `, [userId]);
+    return rows;
+}
 
 // Redis Setup
 const redisUrl = process.env.REDIS_URL;
@@ -140,6 +197,52 @@ app.post('/api/signin', async (req, res) => {
     }
 });
 
+// --- REST API: AUTHENTICATION MIDDLEWARE ---
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Token missing' });
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: 'Invalid token' });
+        req.user = user;
+        next();
+    });
+}
+
+// --- REST API: USER SEARCH (Excludes self & existing relationships using NOT EXISTS for scale) ---
+app.get('/api/users/search', authenticateToken, async (req, res) => {
+    try {
+        const query = req.query.q || '';
+        if (!query.trim()) return res.json({ users: [] });
+        const { rows } = await pool.query(`
+            SELECT u.id, u.username FROM users u
+            WHERE u.id != $1
+              AND u.username ILIKE $2
+              AND NOT EXISTS (
+                  SELECT 1 FROM friendships f
+                  WHERE ((f.sender_id = $1 AND f.receiver_id = u.id) OR (f.receiver_id = $1 AND f.sender_id = u.id))
+                    AND f.status IN ('pending', 'accepted')
+              )
+            LIMIT 15
+        `, [req.user.id, `%${query.trim()}%`]);
+        res.json({ users: rows });
+    } catch (err) {
+        console.error('REST Search error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// --- REST API: PENDING FRIEND REQUESTS ---
+app.get('/api/friends/requests', authenticateToken, async (req, res) => {
+    try {
+        const requests = await getPendingRequests(req.user.id);
+        res.json({ requests });
+    } catch (err) {
+        console.error('REST Requests error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // --- SOCKET.IO AUTHENTICATION MIDDLEWARE ---
 // Intercepts socket handshake, verifies JWT token before allowing connection
 io.use((socket, next) => {
@@ -167,6 +270,9 @@ function getRoomName(id1, id2) {
 io.on('connection', async (socket) => {
     console.log(`[Replica Host: ${os.hostname()}] Authenticated user connected: ${socket.username} (ID: ${socket.userId})`);
 
+    // Join personal user room so multi-replica nodes can target this user directly
+    socket.join(`user_${socket.userId}`);
+
     try {
         // 1. Add user ID to Redis online set
         await pubClient.sAdd('online_users', socket.userId.toString());
@@ -174,19 +280,15 @@ io.on('connection', async (socket) => {
         // Broadcast to all other connected clients that this user is now online
         socket.broadcast.emit('user_status', { id: socket.userId, username: socket.username, isOnline: true });
 
-        // 2. Fetch all registered users (except self) and check status in Redis
-        const { rows: users } = await pool.query('SELECT id, username FROM users WHERE id != $1', [socket.userId]);
-        const onlineUserIds = await pubClient.sMembers('online_users');
+        // 2. Fetch ONLY users who share an 'accepted' friendship status with current user
+        const friendsWithStatus = await getAcceptedFriends(socket.userId);
+        socket.emit('user_list', friendsWithStatus);
 
-        const usersWithStatus = users.map(u => ({
-            id: u.id,
-            username: u.username,
-            isOnline: onlineUserIds.includes(u.id.toString())
-        }));
-
-        socket.emit('user_list', usersWithStatus);
+        // 3. Fetch incoming pending requests for this user
+        const pendingRequests = await getPendingRequests(socket.userId);
+        socket.emit('friend_requests', pendingRequests);
     } catch (err) {
-        console.error('Error fetching user list or presence:', err);
+        console.error('Error fetching friends list or presence:', err);
     }
 
     // Handle user disconnect presence clean-up
@@ -197,6 +299,174 @@ io.on('connection', async (socket) => {
             console.log(`[Replica Host: ${os.hostname()}] User disconnected: ${socket.username}`);
         } catch (err) {
             console.error('Error handling disconnect presence:', err);
+        }
+    });
+
+    // --- FRIEND SYSTEM: USER SEARCH (NOT EXISTS anti-pattern optimization) ---
+    socket.on('search_users', async ({ query }, callback) => {
+        try {
+            if (!query || !query.trim()) {
+                if (callback) return callback({ success: true, users: [] });
+                return socket.emit('search_results', []);
+            }
+            const q = query.trim();
+            const { rows } = await pool.query(`
+                SELECT u.id, u.username FROM users u
+                WHERE u.id != $1
+                  AND u.username ILIKE $2
+                  AND NOT EXISTS (
+                      SELECT 1 FROM friendships f
+                      WHERE ((f.sender_id = $1 AND f.receiver_id = u.id) OR (f.receiver_id = $1 AND f.sender_id = u.id))
+                        AND f.status IN ('pending', 'accepted')
+                  )
+                LIMIT 15
+            `, [socket.userId, `%${q}%`]);
+
+            if (callback) callback({ success: true, users: rows });
+            else socket.emit('search_results', rows);
+        } catch (err) {
+            console.error('Error searching users:', err);
+            if (callback) callback({ success: false, error: 'Search failed' });
+        }
+    });
+
+    // --- FRIEND SYSTEM: SEND FRIEND REQUEST ---
+    socket.on('send_friend_request', async ({ targetUsername, targetUserId }, callback) => {
+        try {
+            let recipientId = targetUserId;
+            if (!recipientId && targetUsername) {
+                const res = await pool.query('SELECT id FROM users WHERE username = $1', [targetUsername]);
+                if (res.rows.length > 0) recipientId = res.rows[0].id;
+            }
+            if (!recipientId) return callback && callback({ success: false, error: 'User not found' });
+            if (recipientId === socket.userId) return callback && callback({ success: false, error: 'Cannot add yourself' });
+
+            // Check if relationship already exists
+            const existing = await pool.query(`
+                SELECT id, sender_id, receiver_id, status FROM friendships
+                WHERE (sender_id = $1 AND receiver_id = $2) OR (sender_id = $2 AND receiver_id = $1)
+            `, [socket.userId, recipientId]);
+
+            if (existing.rows.length > 0) {
+                const rel = existing.rows[0];
+                if (rel.status === 'accepted') {
+                    return callback && callback({ success: false, error: 'Already friends' });
+                }
+                if (rel.status === 'pending') {
+                    if (rel.sender_id === socket.userId) {
+                        return callback && callback({ success: false, error: 'Friend request already pending' });
+                    } else {
+                        // The other user already sent a request, auto-accept
+                        await pool.query("UPDATE friendships SET status = 'accepted', updated_at = NOW() WHERE id = $1", [rel.id]);
+
+                        const myFriends = await getAcceptedFriends(socket.userId);
+                        socket.emit('user_list', myFriends);
+                        const myRequests = await getPendingRequests(socket.userId);
+                        socket.emit('friend_requests', myRequests);
+
+                        const targetFriends = await getAcceptedFriends(recipientId);
+                        io.to(`user_${recipientId}`).emit('user_list', targetFriends);
+                        const targetRequests = await getPendingRequests(recipientId);
+                        io.to(`user_${recipientId}`).emit('friend_requests', targetRequests);
+                        io.to(`user_${recipientId}`).emit('friend_request_accepted', {
+                            friend_id: socket.userId,
+                            friend_username: socket.username
+                        });
+
+                        return callback && callback({ success: true, accepted: true });
+                    }
+                }
+                // If previously rejected, allow re-requesting
+                await pool.query(`
+                    UPDATE friendships SET sender_id = $1, receiver_id = $2, status = 'pending', updated_at = NOW()
+                    WHERE id = $3
+                `, [socket.userId, recipientId, rel.id]);
+            } else {
+                await pool.query(`
+                    INSERT INTO friendships (sender_id, receiver_id, status)
+                    VALUES ($1, $2, 'pending')
+                `, [socket.userId, recipientId]);
+            }
+
+            // Real-time notification across Redis cluster to target user
+            const receiverRequests = await getPendingRequests(recipientId);
+            io.to(`user_${recipientId}`).emit('friend_requests', receiverRequests);
+            io.to(`user_${recipientId}`).emit('new_friend_request', {
+                sender_id: socket.userId,
+                sender_username: socket.username
+            });
+
+            if (callback) callback({ success: true });
+        } catch (err) {
+            console.error('Error sending friend request:', err);
+            if (callback) callback({ success: false, error: 'Failed to send request' });
+        }
+    });
+
+    // --- FRIEND SYSTEM: ACCEPT FRIEND REQUEST ---
+    socket.on('accept_friend_request', async ({ requestId }, callback) => {
+        try {
+            const check = await pool.query(
+                "SELECT sender_id, receiver_id FROM friendships WHERE id = $1 AND receiver_id = $2 AND status = 'pending'",
+                [requestId, socket.userId]
+            );
+            if (check.rows.length === 0) {
+                return callback && callback({ success: false, error: 'Request not found' });
+            }
+            const { sender_id: senderId } = check.rows[0];
+
+            await pool.query(
+                "UPDATE friendships SET status = 'accepted', updated_at = NOW() WHERE id = $1",
+                [requestId]
+            );
+
+            // Refresh current user's requests and accepted friends
+            const myRequests = await getPendingRequests(socket.userId);
+            socket.emit('friend_requests', myRequests);
+            const myFriends = await getAcceptedFriends(socket.userId);
+            socket.emit('user_list', myFriends);
+
+            // Refresh and notify sender via their user room
+            const senderFriends = await getAcceptedFriends(senderId);
+            io.to(`user_${senderId}`).emit('user_list', senderFriends);
+            io.to(`user_${senderId}`).emit('friend_request_accepted', {
+                friend_id: socket.userId,
+                friend_username: socket.username
+            });
+
+            if (callback) callback({ success: true });
+        } catch (err) {
+            console.error('Error accepting friend request:', err);
+            if (callback) callback({ success: false, error: 'Failed to accept request' });
+        }
+    });
+
+    // --- FRIEND SYSTEM: REJECT FRIEND REQUEST ---
+    socket.on('reject_friend_request', async ({ requestId }, callback) => {
+        try {
+            await pool.query(
+                "DELETE FROM friendships WHERE id = $1 AND receiver_id = $2",
+                [requestId, socket.userId]
+            );
+
+            const myRequests = await getPendingRequests(socket.userId);
+            socket.emit('friend_requests', myRequests);
+
+            if (callback) callback({ success: true });
+        } catch (err) {
+            console.error('Error rejecting friend request:', err);
+            if (callback) callback({ success: false, error: 'Failed to reject request' });
+        }
+    });
+
+    // --- FRIEND SYSTEM: FETCH PENDING REQUESTS ---
+    socket.on('get_friend_requests', async (callback) => {
+        try {
+            const requests = await getPendingRequests(socket.userId);
+            if (callback) callback({ success: true, requests });
+            else socket.emit('friend_requests', requests);
+        } catch (err) {
+            console.error('Error getting friend requests:', err);
         }
     });
 
