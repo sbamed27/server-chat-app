@@ -21,9 +21,8 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
-      # In a real app, you would run your testing suite here
-      # - name: Run Tests
-      #   run: npm test
+      - name: Run Tests
+        run: npm test
 
       - name: Trigger Server Deployment
         # This pings your server manager (e.g., EasyPanel) to pull and build the new Docker image
