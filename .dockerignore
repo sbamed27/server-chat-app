@@ -1,0 +1,11 @@
+node_modules
+.git
+.github
+.githooks
+test
+vitest.config.js
+README.md
+.env
+.env.*
+npm-debug.log*
+coverage
