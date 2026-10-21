@@ -10,6 +10,10 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import os from 'os';
 
+// Test mode keeps the module importable without Redis/Postgres or an open port.
+// Production behavior is unchanged.
+const isTest = process.env.NODE_ENV === 'test';
+
 const app = express();
 const httpServer = createServer(app);
 
@@ -82,7 +86,12 @@ async function initDB() {
         console.error('Database initialization error:', err);
     }
 }
-initDB();
+if (!isTest) initDB();
+
+// Lightweight liveness probe (no database or Redis dependency)
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok' });
+});
 
 // Fetch accepted friends for a user with real-time presence from Redis (optimized with SMISMEMBER)
 async function getAcceptedFriends(userId) {
@@ -137,18 +146,24 @@ async function getPendingRequests(userId) {
 
 // Redis Setup
 const redisUrl = process.env.REDIS_URL;
-if (!redisUrl) throw new Error("FATAL: REDIS_URL environment variable is missing.");
+if (!redisUrl && !isTest) {
+    throw new Error("FATAL: REDIS_URL environment variable is missing.");
+}
 
-const pubClient = createClient({ url: redisUrl });
-const subClient = pubClient.duplicate();
+const pubClient = redisUrl ? createClient({ url: redisUrl }) : null;
+const subClient = pubClient ? pubClient.duplicate() : null;
 
-pubClient.on('error', (err) => console.error('Redis Pub Error:', err));
-subClient.on('error', (err) => console.error('Redis Sub Error:', err));
+if (pubClient) {
+    pubClient.on('error', (err) => console.error('Redis Pub Error:', err));
+    subClient.on('error', (err) => console.error('Redis Sub Error:', err));
 
-Promise.all([pubClient.connect(), subClient.connect()]).then(() => {
-    io.adapter(createAdapter(pubClient, subClient));
-    console.log('Redis Pub/Sub adapter connected');
-});
+    Promise.all([pubClient.connect(), subClient.connect()])
+        .then(() => {
+            io.adapter(createAdapter(pubClient, subClient));
+            console.log('Redis Pub/Sub adapter connected');
+        })
+        .catch((err) => console.error('Redis connection error:', err));
+}
 
 // --- REST API: SIGN UP ---
 app.post('/api/signup', async (req, res) => {
@@ -330,17 +345,24 @@ app.get('/api/friends/requests', authenticateToken, async (req, res) => {
 });
 
 // --- SOCKET.IO AUTHENTICATION MIDDLEWARE ---
-// Intercepts socket handshake, verifies JWT token before allowing connection
-io.use((socket, next) => {
-    const token = socket.handshake.auth.token;
+// Verifies a handshake JWT; extracted so it can be tested without a live socket
+function verifySocketToken(token, callback) {
     if (!token) {
-        return next(new Error('Authentication error: Token missing'));
+        return callback(new Error('Authentication error: Token missing'));
     }
 
     jwt.verify(token, JWT_SECRET, (err, decoded) => {
         if (err) {
-            return next(new Error('Authentication error: Invalid token'));
+            return callback(new Error('Authentication error: Invalid token'));
         }
+        callback(null, decoded);
+    });
+}
+
+// Intercepts socket handshake, verifies JWT token before allowing connection
+io.use((socket, next) => {
+    verifySocketToken(socket.handshake.auth?.token, (err, decoded) => {
+        if (err) return next(err);
         socket.userId = decoded.id;
         socket.username = decoded.username;
         next();
@@ -657,12 +679,18 @@ io.on('connection', async (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const server = httpServer.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const server = isTest
+    ? null
+    : httpServer.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-process.on('SIGTERM', () => {
-    server.close(async () => {
-        await pool.end();
-        await Promise.all([pubClient.quit(), subClient.quit()]);
-        process.exit(0);
+if (!isTest) {
+    process.on('SIGTERM', () => {
+        server.close(async () => {
+            await pool.end();
+            await Promise.all([pubClient.quit(), subClient.quit()]);
+            process.exit(0);
+        });
     });
-});
+}
+
+export { app, io, pool, getRoomName, verifySocketToken, JWT_SECRET };

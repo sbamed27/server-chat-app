@@ -1,5 +1,12 @@
 {
   "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "node --check server.js && vitest run",
+    "hooks:install": "git config core.hooksPath .githooks"
+  },
   "dependencies": {
     "@socket.io/redis-adapter": "^8.3.0",
     "bcryptjs": "^3.0.3",
@@ -9,5 +16,9 @@
     "pg": "^8.23.1",
     "redis": "^6.3.0",
     "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "supertest": "^7.3.1",
+    "vitest": "^2.1.9"
   }
 }
